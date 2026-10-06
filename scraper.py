@@ -334,7 +334,7 @@ def _from_json_ld(soup, info, page_url="", title="", listing=False):
             types = _types(d)
             if types & {"Offer", "AggregateOffer"}:
                 price = _to_float(d.get("lowPrice") or d.get("price"))
-                if price:
+                if price and price > 0:
                     offers.append((price, d.get("priceCurrency"), d.get("url"), product,
                                    _min_qty(d)))
                     high = _to_float(d.get("highPrice"))
@@ -387,7 +387,7 @@ def _from_json_ld(soup, info, page_url="", title="", listing=False):
     prices = sorted({o[0] for o in offers})
     pick = next((o for o in offers if _same_url(o[2], page_url)), None)  # linked variant
     if pick is None:
-        pick = min(offers)
+        pick = min(offers, key=lambda o: o[0])  # by price only: tied tuples may hold None
     info["cost"], info["currency"] = pick[0], pick[1] or info["currency"]
     info["cost_source"] = "json-ld" if len(prices) == 1 or pick[2] else \
         f"json-ld (lowest of {len(prices)})"
@@ -410,11 +410,12 @@ def _from_meta(soup, info):
         if price is None:
             vals = [_to_float(el.get("content") or re.sub(r"[^\d.,]", "", el.get_text()))
                     for el in soup.select("[itemprop=price]")]
-            vals = [v for v in vals if v]
+            vals = [v for v in vals if v and v > 0]
             price = vals[0] if vals else None
             if len(set(vals)) > 1:
                 info["ld_prices"] = sorted(set(vals))  # cross-checked against the shown price
-        if price is not None:
+        # 0.00 is a "call for price" placeholder, not a price: it would rank first.
+        if price is not None and price > 0:
             info["cost"] = price
             cur = meta("product:price:currency", "og:price:currency")
             if not cur:
@@ -557,6 +558,8 @@ def part_info(result):
             _from_text(text, info, "page text", listing)  # banners: free shipping etc.
     except (BackendError, requests.RequestException) as e:
         info["fetch_error"] = str(e)
+    except Exception as e:  # one malformed page must not abort the whole thread pool
+        info["fetch_error"] = f"parse error: {e!r}"
     _from_text(f"{result['title']} {result['snippet']}", info, "snippet", listing)
     info["listing_page"] = listing
     info["supplier"] = info["supplier"] or domain
