@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-top5_search.py - Find the best 5 places to buy a part.
+scraper.py - Find the best 5 places to buy a part.
 
 Searches ~30 results, scrapes each for price / supplier / stock / shipping,
 then ranks them and returns the top 5 (see "ranking" section for the weights).
@@ -22,7 +22,8 @@ Ranking (--rank best, default):
   score = order cost incl. shipping / cheapest order cost  x  penalties for
   out-of-stock or short stock, slow or unknown shipping, estimated shipping
   cost, low-confidence price (snippet / search-results page), listings that
-  don't mention the query words, and suspiciously cheap outliers.
+  don't mention the query words or only show a longer variant of the part
+  number (LM317L for LM317), and suspiciously cheap outliers.
   1.00 = the cheapest option with no drawbacks. Lower is better.
   Listings without the part number or a price only fill in if too few remain,
   and at most --per-supplier (2) options come from one supplier.
@@ -32,8 +33,8 @@ Usage:
     pip install requests beautifulsoup4
     python scraper.py "LM7805 voltage regulator"
     python scraper.py "LM7805" -q 50                 # need 50 units
-    fh --rank cheapest
-    python scraper.py "LM7805" --pool 20 -n 5        # compare 50, show best 10
+    python scraper.py "LM7805" --rank cheapest       # lowest order total only
+    python scraper.py "LM7805" --pool 50 -n 10       # compare 50, show best 10
     python scraper.py "query" --json
     python scraper.py "query" --exact                # no "price"/variant queries
     python scraper.py "query" --no-fetch             # snippets only (fast)
@@ -536,7 +537,7 @@ def _blank_info():
             "shipping_time": None, "shipping_cost": None, "free_ship_min": None,
             "stock": None, "in_stock": None,
             "price_breaks": [], "price_range": None, "price_count": 0,
-            "listing_page": False, "fetch_error": None}
+            "listing_page": False, "page_title": None, "fetch_error": None}
 
 
 MAX_PAGE_BYTES = 5_000_000
@@ -572,6 +573,7 @@ def part_info(result):
         soup = BeautifulSoup(_fetch_html(result["url"]), "html.parser")
         h1 = soup.find("h1")
         title = " ".join(h1.get_text(" ").split()) if h1 else ""
+        info["page_title"] = title or None
         _from_json_ld(soup, info, result["url"], title or result["title"], listing)
         _from_meta(soup, info)
         # Drop code and struck-out prices (list/was/strike-through) before reading text.
@@ -622,6 +624,7 @@ PENALTY = {
     "source": {"json-ld": 1.0, "meta": 1.0, "page text": 1.05, "snippet": 1.15},
     "listing_page": 1.12,       # price is the lowest of many listings, may not be this part
     "relevance": 0.6,           # x(1 + 0.6 * fraction of query words missing)
+    "mpn_variant": 1.08,        # part number only inside a longer code (LM317L for LM317)
     "outlier": 1.35,            # unit cost < 25% of the median: likely wrong item/accessory
     "per_search_rank": 0.005,   # tiny tiebreak favouring higher search positions
 }
@@ -633,14 +636,23 @@ def _alnum(s):
 
 
 def relevance(query, r):
-    """(fraction of query words found, part-number match). Part numbers = words with digits."""
+    """(fraction of query words found, part-number match, variant codes seen instead).
+    Part numbers = words with digits. If a part number only shows up inside a longer
+    code (LM317L for LM317), that's a variant: maybe the same part in another package,
+    maybe a different part, so it's listed for the user to check."""
     words = [w for w in re.findall(r"[a-z0-9][a-z0-9.\-/x]*", query.lower())
              if w not in {"price", "buy", "in", "stock", "for", "the", "a"}]
-    hay = _alnum(f"{r['title']} {r['snippet']} {unquote(r['url'])}")
+    raw = f"{r['title']} {r.get('page_title') or ''} {r['snippet']} {unquote(r['url'])}"
+    hay = _alnum(raw)
     found = [w for w in words if _alnum(w) and _alnum(w) in hay]
     keys = [w for w in words if re.search(r"\d", w)]
     key_hit = not keys or any(_alnum(k) in hay for k in keys)
-    return (len(found) / len(words) if words else 1.0), key_hit
+    tokens = {_alnum(t): t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-]*", raw)}
+    variants = []
+    for k in map(_alnum, keys):
+        if k not in tokens:  # no exact token: collect the longer codes it appears in
+            variants += [t for a, t in tokens.items() if k in a and t not in variants]
+    return (len(found) / len(words) if words else 1.0), key_hit, variants
 
 
 def ship_days(text, today=None):
@@ -685,12 +697,14 @@ def score_all(results, query, qty):
 
     for r in results:
         r["score"], r["notes"] = None, []
-        r["relevance"], key_hit = relevance(query, r)
+        r["relevance"], key_hit, r["mpn_variants"] = relevance(query, r)
         if r["subtotal"] is None:
             r["notes"].append("no price found")
             continue
         if not key_hit:
             r["notes"].append("part number not in listing")
+        elif r["mpn_variants"]:
+            r["notes"].append(f"listed as {', '.join(r['mpn_variants'][:3])} - check suffix")
         if r["currency"] and main_cur and r["currency"] != main_cur:
             r["notes"].append(f"priced in {r['currency']}, not {main_cur}")
         ship = _ship_value(r["shipping_cost"])
@@ -724,6 +738,8 @@ def score_all(results, query, qty):
         if r["listing_page"]:
             mult *= PENALTY["listing_page"]; notes.append("search page: lowest listing")
         mult *= 1 + PENALTY["relevance"] * (1 - r["relevance"])
+        if r["mpn_variants"]:
+            mult *= PENALTY["mpn_variant"]
         if med_unit and len(units) >= 4 and r["unit_cost"] < 0.25 * med_unit:
             mult *= PENALTY["outlier"]; notes.append("far cheaper than others - verify item")
         mult *= 1 + PENALTY["per_search_rank"] * r["search_rank"]
