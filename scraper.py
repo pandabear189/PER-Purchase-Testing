@@ -539,17 +539,37 @@ def _blank_info():
             "listing_page": False, "fetch_error": None}
 
 
+MAX_PAGE_BYTES = 5_000_000
+
+
+def _fetch_html(url):
+    """GET a page as text; refuse non-HTML (datasheet PDFs are common part-number hits)
+    and stop reading after MAX_PAGE_BYTES."""
+    with requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                      timeout=TIMEOUT, stream=True) as r:
+        if r.status_code != 200:
+            raise BackendError(f"HTTP {r.status_code}")
+        ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ctype and "html" not in ctype and "xml" not in ctype:
+            raise BackendError(f"not a web page ({ctype})")
+        body = bytearray()
+        for chunk in r.iter_content(64 * 1024):
+            body += chunk
+            if len(body) >= MAX_PAGE_BYTES:
+                break
+        try:  # same decoding as r.text
+            return body.decode(r.encoding or "utf-8", errors="replace")
+        except LookupError:  # unknown charset name in the headers
+            return body.decode("utf-8", errors="replace")
+
+
 def part_info(result):
     """Fetch a result page and pull cost / supplier / shipping details."""
     domain = urlparse(result["url"]).netloc.lower().removeprefix("www.")
     info = _blank_info()
     listing = bool(LISTING_URL_RE.search(result["url"]))
     try:
-        r = requests.get(result["url"], headers={"User-Agent": UA,
-                         "Accept-Language": "en-US,en;q=0.9"}, timeout=TIMEOUT)
-        if r.status_code != 200:
-            raise BackendError(f"HTTP {r.status_code}")
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(_fetch_html(result["url"]), "html.parser")
         h1 = soup.find("h1")
         title = " ".join(h1.get_text(" ").split()) if h1 else ""
         _from_json_ld(soup, info, result["url"], title or result["title"], listing)
