@@ -79,8 +79,28 @@ def test_threshold_before_free_shipping():
     assert info["free_ship_min"] == 50.0
 
 
-def test_unconditional_free_shipping():
-    assert text_info("This item ships with free shipping")["shipping_cost"] == "Free"
+def test_amazon_member_and_threshold_free_delivery():
+    info = text_info("$4.99 Join Prime to get FREE delivery Tomorrow, Oct 7 Or Non-members "
+                     "get FREE delivery Sun, Oct 11 on $35 of items shipped by Amazon")
+    assert info["shipping_cost"] is None
+    assert info["free_ship_min"] == 35.0
+
+
+def test_member_only_free_delivery_is_not_free():
+    info = text_info("$6.69 Join Prime to get FREE delivery Tomorrow, Oct 7 Add to cart")
+    assert info["shipping_cost"] is None and info["free_ship_min"] is None
+
+
+def test_search_filter_free_shipping_is_not_free():
+    info = text_info("No selected filters Eligible for Free Shipping Free Shipping by Amazon "
+                     "Get FREE Shipping on eligible orders shipped by Amazon $2.00")
+    assert info["shipping_cost"] is None
+
+
+@pytest.mark.parametrize("text", ["This item ships with free shipping",
+                                  "$9.99 FREE delivery by Thursday, Oct 9"])
+def test_unconditional_free_shipping(text):
+    assert text_info(text)["shipping_cost"] == "Free"
 
 
 def test_shipping_threshold_is_not_the_fee():

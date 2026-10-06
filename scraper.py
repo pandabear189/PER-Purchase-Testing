@@ -235,8 +235,19 @@ FREE_SHIP_RE = re.compile(r"\bfree\s+(?:standard\s+|ground\s+|economy\s+|2-day\s
                           r"(?:shipping|delivery)\b", re.I)
 # "Free shipping on orders over $100" is conditional, not free: the threshold is
 # looked for just after (or before, "spend $50 for free shipping") the match.
-FREE_SHIP_MIN_RE = re.compile(r"\b(?:orders?|purchases?|over|above|spend|minimum|min\.?)\b"
-                              r"[^$€£¥\d]{0,15}" + MONEY, re.I)
+FREE_SHIP_MIN_RES = [
+    re.compile(r"\b(?:orders?|purchases?|over|above|spend|minimum|min\.?)\b"
+               r"[^$€£¥\d]{0,15}" + MONEY, re.I),
+    re.compile(r"\bon\s" + MONEY + r"\s?(?:\+|or\smore|of\s)", re.I),  # "on $35 of items"
+]
+# Conditional offers that don't make *this* order free, so aren't counted:
+# "Join Prime to get FREE delivery", "Eligible for Free Shipping" (a search filter),
+# "Free Shipping by Amazon", "FREE Shipping on eligible orders".
+FREE_SHIP_COND_BEFORE_RE = re.compile(
+    r"(?<!non-)\b(?:prime|members?|membership|eligible|qualifying)\b", re.I)
+FREE_SHIP_COND_AFTER_RE = re.compile(
+    r"^\W{0,3}(?:on\s(?:eligible|qualifying|select)|eligible|"
+    r"by\s(?!(?:mon|tue|wed|thu|fri|sat|sun)|tomorrow|today))", re.I)
 SHIP_COST_RE = re.compile(r"(?:shipping|delivery|postage)(?:\s+(?:cost|fee|charge|rate))?"
                           r"[^$€£¥\n.]{0,25}" + MONEY, re.I)
 SPAN = r"(\d+\s?(?:-|–|to)\s?\d+|\d+)\s?(business\s|working\s)?(hours?|days?|weeks?)"
@@ -445,6 +456,15 @@ def _text_prices(text):
     return out
 
 
+def _ship_threshold(s):
+    """Order minimum in a free-shipping phrase ("on orders over $100"), else None."""
+    for rx in FREE_SHIP_MIN_RES:
+        m = rx.search(s)
+        if m:
+            return _to_float(m.group(2))
+    return None
+
+
 def _from_text(text, info, source, listing=False):
     if info["cost"] is None:
         prices = _text_prices(text)
@@ -461,16 +481,20 @@ def _from_text(text, info, source, listing=False):
                 info["price_count"] = len(vals)
     if info["shipping_cost"] is None:
         for m in FREE_SHIP_RE.finditer(text):
-            t = (FREE_SHIP_MIN_RE.search(text[m.end():m.end() + 50]) or
-                 FREE_SHIP_MIN_RE.search(text[max(0, m.start() - 40):m.start()]))
+            if FREE_SHIP_COND_BEFORE_RE.search(text[max(0, m.start() - 25):m.start()]) or \
+                    FREE_SHIP_COND_AFTER_RE.search(text[m.end():m.end() + 25]):
+                continue
+            t = _ship_threshold(text[m.end():m.end() + 50])
+            if t is None:
+                t = _ship_threshold(text[max(0, m.start() - 40):m.start()])
             if t is None:
                 info["shipping_cost"] = "Free"
                 break
             if info["free_ship_min"] is None:
-                info["free_ship_min"] = _to_float(t.group(2))  # apply_qty checks the order
+                info["free_ship_min"] = t  # apply_qty checks the order against it
         if info["shipping_cost"] is None:
             for m in SHIP_COST_RE.finditer(text):
-                if FREE_SHIP_MIN_RE.search(m.group(0)):
+                if _ship_threshold(text[m.start():m.end() + 15]) is not None:
                     continue  # "shipping on orders over $100" is a threshold, not a fee
                 info["shipping_cost"] = f"{m.group(1)}{m.group(2)}"
                 break
