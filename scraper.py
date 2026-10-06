@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-top5_search.py - Find the best 5 places to buy a part.
+scraper.py - Find the best 5 places to buy a part.
 
 Searches ~30 results, scrapes each for price / supplier / stock / shipping,
 then ranks them and returns the top 5 (see "ranking" section for the weights).
@@ -22,7 +22,8 @@ Ranking (--rank best, default):
   score = order cost incl. shipping / cheapest order cost  x  penalties for
   out-of-stock or short stock, slow or unknown shipping, estimated shipping
   cost, low-confidence price (snippet / search-results page), listings that
-  don't mention the query words, and suspiciously cheap outliers.
+  don't mention the query words or only show a longer variant of the part
+  number (LM317L for LM317), and suspiciously cheap outliers.
   1.00 = the cheapest option with no drawbacks. Lower is better.
   Listings without the part number or a price only fill in if too few remain,
   and at most --per-supplier (2) options come from one supplier.
@@ -32,8 +33,8 @@ Usage:
     pip install requests beautifulsoup4
     python scraper.py "LM7805 voltage regulator"
     python scraper.py "LM7805" -q 50                 # need 50 units
-    fh --rank cheapest
-    python scraper.py "LM7805" --pool 20 -n 5        # compare 50, show best 10
+    python scraper.py "LM7805" --rank cheapest       # lowest order total only
+    python scraper.py "LM7805" --pool 50 -n 10       # compare 50, show best 10
     python scraper.py "query" --json
     python scraper.py "query" --exact                # no "price"/variant queries
     python scraper.py "query" --no-fetch             # snippets only (fast)
@@ -222,7 +223,7 @@ MONEY_RE = re.compile(MONEY)
 # Amounts that aren't the item's selling price: filters, free-shipping thresholds,
 # struck-out list/was prices, discounts, shipping fees.
 NOISE_BEFORE_RE = re.compile(
-    r"(?:under|over|above|below|up to|\bon|orders?(?:\s(?:over|of|above))?|spend|save|"
+    r"\b(?:under|over|above|below|up to|on|orders?(?:\s(?:over|of|above))?|spend|save|"
     r"savings|off|coupon|was|list(?:\sprice)?|typical(?:\sprice)?|msrp|rrp|reg(?:ular)?|"
     r"compare\sat|retail|shipping|delivery|postage|credit|reward|gift\scard)\W{0,3}$", re.I)
 NOISE_AFTER_RE = re.compile(r"^\s?(?:off|or\smore|\+|and\sup|minimum|shipping|delivery)\b",
@@ -232,6 +233,21 @@ LISTING_URL_RE = re.compile(r"/s\?|/search|/sch/|/b/|[?&](?:q|k|_nkw|keywords?|s
                             r"/category|/c/|/browse", re.I)
 FREE_SHIP_RE = re.compile(r"\bfree\s+(?:standard\s+|ground\s+|economy\s+|2-day\s+)?"
                           r"(?:shipping|delivery)\b", re.I)
+# "Free shipping on orders over $100" is conditional, not free: the threshold is
+# looked for just after (or before, "spend $50 for free shipping") the match.
+FREE_SHIP_MIN_RES = [
+    re.compile(r"\b(?:orders?|purchases?|over|above|spend|minimum|min\.?)\b"
+               r"[^$€£¥\d]{0,15}" + MONEY, re.I),
+    re.compile(r"\bon\s" + MONEY + r"\s?(?:\+|or\smore|of\s)", re.I),  # "on $35 of items"
+]
+# Conditional offers that don't make *this* order free, so aren't counted:
+# "Join Prime to get FREE delivery", "Eligible for Free Shipping" (a search filter),
+# "Free Shipping by Amazon", "FREE Shipping on eligible orders".
+FREE_SHIP_COND_BEFORE_RE = re.compile(
+    r"(?<!non-)\b(?:prime|members?|membership|eligible|qualifying)\b", re.I)
+FREE_SHIP_COND_AFTER_RE = re.compile(
+    r"^\W{0,3}(?:on\s(?:eligible|qualifying|select)|eligible|"
+    r"by\s(?!(?:mon|tue|wed|thu|fri|sat|sun)|tomorrow|today))", re.I)
 SHIP_COST_RE = re.compile(r"(?:shipping|delivery|postage)(?:\s+(?:cost|fee|charge|rate))?"
                           r"[^$€£¥\n.]{0,25}" + MONEY, re.I)
 SPAN = r"(\d+\s?(?:-|–|to)\s?\d+|\d+)\s?(business\s|working\s)?(hours?|days?|weeks?)"
@@ -334,7 +350,7 @@ def _from_json_ld(soup, info, page_url="", title="", listing=False):
             types = _types(d)
             if types & {"Offer", "AggregateOffer"}:
                 price = _to_float(d.get("lowPrice") or d.get("price"))
-                if price:
+                if price and price > 0:
                     offers.append((price, d.get("priceCurrency"), d.get("url"), product,
                                    _min_qty(d)))
                     high = _to_float(d.get("highPrice"))
@@ -387,7 +403,7 @@ def _from_json_ld(soup, info, page_url="", title="", listing=False):
     prices = sorted({o[0] for o in offers})
     pick = next((o for o in offers if _same_url(o[2], page_url)), None)  # linked variant
     if pick is None:
-        pick = min(offers)
+        pick = min(offers, key=lambda o: o[0])  # by price only: tied tuples may hold None
     info["cost"], info["currency"] = pick[0], pick[1] or info["currency"]
     info["cost_source"] = "json-ld" if len(prices) == 1 or pick[2] else \
         f"json-ld (lowest of {len(prices)})"
@@ -410,11 +426,12 @@ def _from_meta(soup, info):
         if price is None:
             vals = [_to_float(el.get("content") or re.sub(r"[^\d.,]", "", el.get_text()))
                     for el in soup.select("[itemprop=price]")]
-            vals = [v for v in vals if v]
+            vals = [v for v in vals if v and v > 0]
             price = vals[0] if vals else None
             if len(set(vals)) > 1:
                 info["ld_prices"] = sorted(set(vals))  # cross-checked against the shown price
-        if price is not None:
+        # 0.00 is a "call for price" placeholder, not a price: it would rank first.
+        if price is not None and price > 0:
             info["cost"] = price
             cur = meta("product:price:currency", "og:price:currency")
             if not cur:
@@ -439,6 +456,15 @@ def _text_prices(text):
     return out
 
 
+def _ship_threshold(s):
+    """Order minimum in a free-shipping phrase ("on orders over $100"), else None."""
+    for rx in FREE_SHIP_MIN_RES:
+        m = rx.search(s)
+        if m:
+            return _to_float(m.group(2))
+    return None
+
+
 def _from_text(text, info, source, listing=False):
     if info["cost"] is None:
         prices = _text_prices(text)
@@ -454,12 +480,24 @@ def _from_text(text, info, source, listing=False):
                 info["price_range"] = [min(vals), max(vals)]
                 info["price_count"] = len(vals)
     if info["shipping_cost"] is None:
-        if FREE_SHIP_RE.search(text):
-            info["shipping_cost"] = "Free"
-        else:
-            m = SHIP_COST_RE.search(text)
-            if m:
+        for m in FREE_SHIP_RE.finditer(text):
+            if FREE_SHIP_COND_BEFORE_RE.search(text[max(0, m.start() - 25):m.start()]) or \
+                    FREE_SHIP_COND_AFTER_RE.search(text[m.end():m.end() + 25]):
+                continue
+            t = _ship_threshold(text[m.end():m.end() + 50])
+            if t is None:
+                t = _ship_threshold(text[max(0, m.start() - 40):m.start()])
+            if t is None:
+                info["shipping_cost"] = "Free"
+                break
+            if info["free_ship_min"] is None:
+                info["free_ship_min"] = t  # apply_qty checks the order against it
+        if info["shipping_cost"] is None:
+            for m in SHIP_COST_RE.finditer(text):
+                if _ship_threshold(text[m.start():m.end() + 15]) is not None:
+                    continue  # "shipping on orders over $100" is a threshold, not a fee
                 info["shipping_cost"] = f"{m.group(1)}{m.group(2)}"
+                break
     if info["shipping_time"] is None:
         for rx in SHIP_TIME_RES:
             m = rx.search(text)
@@ -508,6 +546,9 @@ def apply_qty(r, qty):
         return r
     r["unit_cost"] = round(price / pack, 4)
     r["subtotal"] = round(price * packs, 2)
+    if r["shipping_cost"] is None and r["free_ship_min"] is not None \
+            and r["subtotal"] >= r["free_ship_min"]:
+        r["shipping_cost"] = "Free"  # order clears the free-shipping threshold
     ship = r["shipping_cost"]
     ship_val = 0.0 if ship == "Free" else _to_float(re.sub(r"[^\d.]", "", ship or "") or None)
     if ship_val is not None:
@@ -517,9 +558,34 @@ def apply_qty(r, qty):
 
 def _blank_info():
     return {"cost": None, "currency": None, "cost_source": None, "supplier": None,
-            "shipping_time": None, "shipping_cost": None, "stock": None, "in_stock": None,
+            "shipping_time": None, "shipping_cost": None, "free_ship_min": None,
+            "stock": None, "in_stock": None,
             "price_breaks": [], "price_range": None, "price_count": 0,
-            "listing_page": False, "fetch_error": None}
+            "listing_page": False, "page_title": None, "fetch_error": None}
+
+
+MAX_PAGE_BYTES = 5_000_000
+
+
+def _fetch_html(url):
+    """GET a page as text; refuse non-HTML (datasheet PDFs are common part-number hits)
+    and stop reading after MAX_PAGE_BYTES."""
+    with requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                      timeout=TIMEOUT, stream=True) as r:
+        if r.status_code != 200:
+            raise BackendError(f"HTTP {r.status_code}")
+        ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ctype and "html" not in ctype and "xml" not in ctype:
+            raise BackendError(f"not a web page ({ctype})")
+        body = bytearray()
+        for chunk in r.iter_content(64 * 1024):
+            body += chunk
+            if len(body) >= MAX_PAGE_BYTES:
+                break
+        try:  # same decoding as r.text
+            return body.decode(r.encoding or "utf-8", errors="replace")
+        except LookupError:  # unknown charset name in the headers
+            return body.decode("utf-8", errors="replace")
 
 
 def part_info(result):
@@ -528,13 +594,10 @@ def part_info(result):
     info = _blank_info()
     listing = bool(LISTING_URL_RE.search(result["url"]))
     try:
-        r = requests.get(result["url"], headers={"User-Agent": UA,
-                         "Accept-Language": "en-US,en;q=0.9"}, timeout=TIMEOUT)
-        if r.status_code != 200:
-            raise BackendError(f"HTTP {r.status_code}")
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(_fetch_html(result["url"]), "html.parser")
         h1 = soup.find("h1")
         title = " ".join(h1.get_text(" ").split()) if h1 else ""
+        info["page_title"] = title or None
         _from_json_ld(soup, info, result["url"], title or result["title"], listing)
         _from_meta(soup, info)
         # Drop code and struck-out prices (list/was/strike-through) before reading text.
@@ -557,6 +620,8 @@ def part_info(result):
             _from_text(text, info, "page text", listing)  # banners: free shipping etc.
     except (BackendError, requests.RequestException) as e:
         info["fetch_error"] = str(e)
+    except Exception as e:  # one malformed page must not abort the whole thread pool
+        info["fetch_error"] = f"parse error: {e!r}"
     _from_text(f"{result['title']} {result['snippet']}", info, "snippet", listing)
     info["listing_page"] = listing
     info["supplier"] = info["supplier"] or domain
@@ -583,6 +648,7 @@ PENALTY = {
     "source": {"json-ld": 1.0, "meta": 1.0, "page text": 1.05, "snippet": 1.15},
     "listing_page": 1.12,       # price is the lowest of many listings, may not be this part
     "relevance": 0.6,           # x(1 + 0.6 * fraction of query words missing)
+    "mpn_variant": 1.08,        # part number only inside a longer code (LM317L for LM317)
     "outlier": 1.35,            # unit cost < 25% of the median: likely wrong item/accessory
     "per_search_rank": 0.005,   # tiny tiebreak favouring higher search positions
 }
@@ -594,14 +660,23 @@ def _alnum(s):
 
 
 def relevance(query, r):
-    """(fraction of query words found, part-number match). Part numbers = words with digits."""
+    """(fraction of query words found, part-number match, variant codes seen instead).
+    Part numbers = words with digits. If a part number only shows up inside a longer
+    code (LM317L for LM317), that's a variant: maybe the same part in another package,
+    maybe a different part, so it's listed for the user to check."""
     words = [w for w in re.findall(r"[a-z0-9][a-z0-9.\-/x]*", query.lower())
              if w not in {"price", "buy", "in", "stock", "for", "the", "a"}]
-    hay = _alnum(f"{r['title']} {r['snippet']} {unquote(r['url'])}")
+    raw = f"{r['title']} {r.get('page_title') or ''} {r['snippet']} {unquote(r['url'])}"
+    hay = _alnum(raw)
     found = [w for w in words if _alnum(w) and _alnum(w) in hay]
     keys = [w for w in words if re.search(r"\d", w)]
     key_hit = not keys or any(_alnum(k) in hay for k in keys)
-    return (len(found) / len(words) if words else 1.0), key_hit
+    tokens = {_alnum(t): t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-]*", raw)}
+    variants = []
+    for k in map(_alnum, keys):
+        if k not in tokens:  # no exact token: collect the longer codes it appears in
+            variants += [t for a, t in tokens.items() if k in a and t not in variants]
+    return (len(found) / len(words) if words else 1.0), key_hit, variants
 
 
 def ship_days(text, today=None):
@@ -616,7 +691,7 @@ def ship_days(text, today=None):
     m = re.search(r"(\d+)(?:\s?(?:-|–|to)\s?(\d+))?\s?(?:business\s|working\s)?(hour|day|week)", t)
     if m:
         n = int(m.group(2) or m.group(1))
-        return {"hour": 1, "day": n, "week": 7 * n}[m.group(3)]
+        return {"hour": max(1, -(-n // 24)), "day": n, "week": 7 * n}[m.group(3)]
     m = re.search(r"([a-z]{3})[a-z]*\.?\s(\d{1,2})$", t)
     if m:
         try:
@@ -646,12 +721,14 @@ def score_all(results, query, qty):
 
     for r in results:
         r["score"], r["notes"] = None, []
-        r["relevance"], key_hit = relevance(query, r)
+        r["relevance"], key_hit, r["mpn_variants"] = relevance(query, r)
         if r["subtotal"] is None:
             r["notes"].append("no price found")
             continue
         if not key_hit:
             r["notes"].append("part number not in listing")
+        elif r["mpn_variants"]:
+            r["notes"].append(f"listed as {', '.join(r['mpn_variants'][:3])} - check suffix")
         if r["currency"] and main_cur and r["currency"] != main_cur:
             r["notes"].append(f"priced in {r['currency']}, not {main_cur}")
         ship = _ship_value(r["shipping_cost"])
@@ -685,6 +762,8 @@ def score_all(results, query, qty):
         if r["listing_page"]:
             mult *= PENALTY["listing_page"]; notes.append("search page: lowest listing")
         mult *= 1 + PENALTY["relevance"] * (1 - r["relevance"])
+        if r["mpn_variants"]:
+            mult *= PENALTY["mpn_variant"]
         if med_unit and len(units) >= 4 and r["unit_cost"] < 0.25 * med_unit:
             mult *= PENALTY["outlier"]; notes.append("far cheaper than others - verify item")
         mult *= 1 + PENALTY["per_search_rank"] * r["search_rank"]
@@ -852,7 +931,9 @@ def main():
         print(f"   Buy:           {buy} = {money(r['subtotal'], cur)}")
         print(f"   Stock:         {stock}")
         print(f"   Shipping time: {r['shipping_time'] or 'n/a'}")
-        print(f"   Shipping cost: {r['shipping_cost'] or 'n/a'}")
+        free_min = (f"  (free over {money(r['free_ship_min'], cur)})"
+                    if r["free_ship_min"] is not None else "")
+        print(f"   Shipping cost: {r['shipping_cost'] or 'n/a'}{free_min}")
         print(f"   Total:         {money(r['total'], cur)}"
               + ("" if r["total"] is not None or r["subtotal"] is None else
                  f"  (est. {money(r.get('effective_cost'), cur)} incl. typical shipping)"))
