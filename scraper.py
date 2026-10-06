@@ -222,7 +222,7 @@ MONEY_RE = re.compile(MONEY)
 # Amounts that aren't the item's selling price: filters, free-shipping thresholds,
 # struck-out list/was prices, discounts, shipping fees.
 NOISE_BEFORE_RE = re.compile(
-    r"(?:under|over|above|below|up to|\bon|orders?(?:\s(?:over|of|above))?|spend|save|"
+    r"\b(?:under|over|above|below|up to|on|orders?(?:\s(?:over|of|above))?|spend|save|"
     r"savings|off|coupon|was|list(?:\sprice)?|typical(?:\sprice)?|msrp|rrp|reg(?:ular)?|"
     r"compare\sat|retail|shipping|delivery|postage|credit|reward|gift\scard)\W{0,3}$", re.I)
 NOISE_AFTER_RE = re.compile(r"^\s?(?:off|or\smore|\+|and\sup|minimum|shipping|delivery)\b",
@@ -232,6 +232,10 @@ LISTING_URL_RE = re.compile(r"/s\?|/search|/sch/|/b/|[?&](?:q|k|_nkw|keywords?|s
                             r"/category|/c/|/browse", re.I)
 FREE_SHIP_RE = re.compile(r"\bfree\s+(?:standard\s+|ground\s+|economy\s+|2-day\s+)?"
                           r"(?:shipping|delivery)\b", re.I)
+# "Free shipping on orders over $100" is conditional, not free: the threshold is
+# looked for just after (or before, "spend $50 for free shipping") the match.
+FREE_SHIP_MIN_RE = re.compile(r"\b(?:orders?|purchases?|over|above|spend|minimum|min\.?)\b"
+                              r"[^$€£¥\d]{0,15}" + MONEY, re.I)
 SHIP_COST_RE = re.compile(r"(?:shipping|delivery|postage)(?:\s+(?:cost|fee|charge|rate))?"
                           r"[^$€£¥\n.]{0,25}" + MONEY, re.I)
 SPAN = r"(\d+\s?(?:-|–|to)\s?\d+|\d+)\s?(business\s|working\s)?(hours?|days?|weeks?)"
@@ -455,12 +459,20 @@ def _from_text(text, info, source, listing=False):
                 info["price_range"] = [min(vals), max(vals)]
                 info["price_count"] = len(vals)
     if info["shipping_cost"] is None:
-        if FREE_SHIP_RE.search(text):
-            info["shipping_cost"] = "Free"
-        else:
-            m = SHIP_COST_RE.search(text)
-            if m:
+        for m in FREE_SHIP_RE.finditer(text):
+            t = (FREE_SHIP_MIN_RE.search(text[m.end():m.end() + 50]) or
+                 FREE_SHIP_MIN_RE.search(text[max(0, m.start() - 40):m.start()]))
+            if t is None:
+                info["shipping_cost"] = "Free"
+                break
+            if info["free_ship_min"] is None:
+                info["free_ship_min"] = _to_float(t.group(2))  # apply_qty checks the order
+        if info["shipping_cost"] is None:
+            for m in SHIP_COST_RE.finditer(text):
+                if FREE_SHIP_MIN_RE.search(m.group(0)):
+                    continue  # "shipping on orders over $100" is a threshold, not a fee
                 info["shipping_cost"] = f"{m.group(1)}{m.group(2)}"
+                break
     if info["shipping_time"] is None:
         for rx in SHIP_TIME_RES:
             m = rx.search(text)
@@ -509,6 +521,9 @@ def apply_qty(r, qty):
         return r
     r["unit_cost"] = round(price / pack, 4)
     r["subtotal"] = round(price * packs, 2)
+    if r["shipping_cost"] is None and r["free_ship_min"] is not None \
+            and r["subtotal"] >= r["free_ship_min"]:
+        r["shipping_cost"] = "Free"  # order clears the free-shipping threshold
     ship = r["shipping_cost"]
     ship_val = 0.0 if ship == "Free" else _to_float(re.sub(r"[^\d.]", "", ship or "") or None)
     if ship_val is not None:
@@ -518,7 +533,8 @@ def apply_qty(r, qty):
 
 def _blank_info():
     return {"cost": None, "currency": None, "cost_source": None, "supplier": None,
-            "shipping_time": None, "shipping_cost": None, "stock": None, "in_stock": None,
+            "shipping_time": None, "shipping_cost": None, "free_ship_min": None,
+            "stock": None, "in_stock": None,
             "price_breaks": [], "price_range": None, "price_count": 0,
             "listing_page": False, "fetch_error": None}
 
@@ -619,7 +635,7 @@ def ship_days(text, today=None):
     m = re.search(r"(\d+)(?:\s?(?:-|–|to)\s?(\d+))?\s?(?:business\s|working\s)?(hour|day|week)", t)
     if m:
         n = int(m.group(2) or m.group(1))
-        return {"hour": 1, "day": n, "week": 7 * n}[m.group(3)]
+        return {"hour": max(1, -(-n // 24)), "day": n, "week": 7 * n}[m.group(3)]
     m = re.search(r"([a-z]{3})[a-z]*\.?\s(\d{1,2})$", t)
     if m:
         try:
@@ -855,7 +871,9 @@ def main():
         print(f"   Buy:           {buy} = {money(r['subtotal'], cur)}")
         print(f"   Stock:         {stock}")
         print(f"   Shipping time: {r['shipping_time'] or 'n/a'}")
-        print(f"   Shipping cost: {r['shipping_cost'] or 'n/a'}")
+        free_min = (f"  (free over {money(r['free_ship_min'], cur)})"
+                    if r["free_ship_min"] is not None else "")
+        print(f"   Shipping cost: {r['shipping_cost'] or 'n/a'}{free_min}")
         print(f"   Total:         {money(r['total'], cur)}"
               + ("" if r["total"] is not None or r["subtotal"] is None else
                  f"  (est. {money(r.get('effective_cost'), cur)} incl. typical shipping)"))
